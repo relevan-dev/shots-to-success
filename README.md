@@ -4,6 +4,24 @@ Large language models often struggle to use search interfaces reliably. Query sy
 
 The Shots to Success Benchmark measures how many search attempts an LLM agent needs to retrieve relevant documents. Existing benchmarks often measure whether an agent eventually answers correctly. This benchmark measures whether a search system helps an agent find relevant results faster, recover from failed searches, and stop once good results have been found.
 
+
+## **Quick start**
+
+```bash
+pip install -e .
+export ANTHROPIC_API_KEY=sk-ant-...
+
+sts prepare --dataset trec-tot                          # ~950 MB
+sts sweep --dataset trec-tot --limit 25                 # all conditions, then compare
+```
+
+`sts sweep` builds the index once, pins one episode set, runs every condition
+against it, and prints a comparison table. See **Using the harness** below.
+
+Three datasets ship: `trec-tot` (recommended), `wands`, and `beir` (15+
+subsets). Which to use, and why it matters more than it looks, is in
+[docs/DATASETS.md](docs/DATASETS.md).
+
 ## 
 
 ## **Success Criteria**
@@ -130,3 +148,240 @@ This track answers:
 
 Which retrieval system helps an agent reach relevant documents fastest under the same benchmark episodes, model, prompt, search budget, and relevance judgments?
 
+
+
+---
+
+# **Using the harness**
+
+## **Install**
+
+```bash
+pip install -e .              # or: uv pip install -e ".[dev]"
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+The only runtime dependency is the `anthropic` SDK. The reference search
+backend is pure Python — no search engine to stand up.
+
+## **Commands**
+
+| Command | What it does |
+|---|---|
+| `sts list` | Built-in datasets, adapters, and conditions |
+| `sts prepare --dataset trec-tot` | Download source files and report corpus size |
+| `sts episodes --difficulty hard -o set.json` | Materialize an episode set for pinning |
+| `sts run --condition feedback` | Run one condition |
+| `sts sweep --conditions static,results_only,feedback` | Run several against one shared episode set, then compare |
+| `sts report runs/a runs/b` | Comparison table, with comparability warnings |
+| `sts inspect runs/a --failures` | Per-episode trajectories, for reading what actually happened |
+| `sts regrade runs/a --k 3` | Re-score a finished run — no model calls |
+
+## **A run**
+
+```bash
+sts sweep \
+    --dataset wands --adapter bm25 \
+    --conditions static,results_only,feedback \
+    --difficulty hard --max-shots 3 --k 10 \
+    --model claude-opus-5 --effort high
+```
+
+Each condition writes `runs/<run_id>/`:
+
+```
+manifest.json      every controlled variable, the exact system prompt and its
+                   hash, the episode set hash, dataset and adapter provenance
+episodes.jsonl     one graded episode per line, written as it finishes
+episode_set.json   the query ids scored
+summary.json       aggregate metrics
+```
+
+Runs are resumable: rerunning the same `--run-id` skips episodes already
+recorded. Episodes are graded from the recorded result sets, so `sts regrade`
+can rescore an entire run at a different `k` or relevance threshold without
+spending a single token.
+
+## **How it fits together**
+
+```
+Dataset  ──queries──────────────────────────┐
+   │                                        │
+   ├──corpus────▶  SearchAdapter  ──tools──▶ Agent loop ──▶ Episode
+   │                                                          │
+   └──judgments (hidden) ──────────────────▶  Grader  ◀───────┘
+```
+
+The agent loop is never handed judgments and cannot import them — a test
+asserts this against the module's imports, because it is the property that
+makes the hidden labels actually hidden. Everything the model saw is recorded,
+so grading is a pure function of the transcript.
+
+## **Adapters are the extension point**
+
+A search system enters the benchmark by exposing tools. Each tool declares
+whether calling it spends a shot:
+
+- **`RETRIEVAL`** — returns a ranked, gradable result set. Costs one shot.
+- **`AUXILIARY`** — autocomplete, facets, schema, score explanation. Free.
+
+That split is deliberate. If a provider exposes an autocomplete endpoint that
+helps an agent build a better query, charging a shot for it would penalize the
+system for offering it. So auxiliary calls are recorded but do not count.
+
+```bash
+sts run --adapter mypkg.adapters:MyAdapter --adapter-opt base_url=https://...
+```
+
+No registration, no changes to this repository. Full guide in
+[docs/ADAPTERS.md](docs/ADAPTERS.md); a hosted-service template with an
+autocomplete endpoint is in [examples/http_adapter.py](examples/http_adapter.py).
+
+The bundled `bm25` adapter is the reference implementation and exposes the full
+surface: `search` (with filters), `autocomplete`, `facets`, `describe_index`,
+and `explain_result`.
+
+A second adapter, `relevan`, runs the benchmark against the hosted search API at
+`api.relevan.dev` — it creates an index, derives a mapping from the dataset's
+own fields, ingests the corpus, and exposes `search` (filters and per-term
+boosts), the index's generated skill doc, and per-document score explanation:
+
+```bash
+export RELEVAN_API_KEY=...
+sts run --dataset trec-tot --adapter relevan --condition feedback
+```
+
+Ingest happens once per dataset; later runs reuse the index. Details, options,
+and why result feedback is off by default are in [docs/RELEVAN.md](docs/RELEVAN.md).
+
+## **Conditions**
+
+| Condition | Model in loop | Diagnostics | Auxiliary tools | Track |
+|---|---|---|---|---|
+| `static` | no | — | — | baseline |
+| `results_only` | yes | no | no | Feedback |
+| `feedback` | yes | **yes** | no | Feedback |
+| `tooling` | yes | yes | **yes** | Tooling |
+
+`results_only` and `feedback` are byte-identical in prompt and tool contract —
+verified by a test — so the difference between them is attributable to
+diagnostics alone. `tooling` widens the tool contract, which is a different
+track and a different question.
+
+## **Metrics**
+
+Primary:
+
+- **`shots_to_success`** — mean attempts until a judged-relevant document first
+  appeared in the top *k*, over episodes that ever succeeded. Always read it
+  next to `success@k`: a system that only solves easy queries gets a
+  flattering mean.
+- **`shots_to_success_censored`** — the same, with failures charged
+  `max_shots + 1`. One scalar that orders systems without hiding failures.
+
+Guardrails: `success@k` (on the **submitted** set), `success_any@k` (any
+attempt), `recovery_rate`, `bad_retry_rate` (retries that lowered nDCG@k),
+`oversearch_rate` (successful episodes that kept searching after the need was
+already met).
+
+Diagnostics: `ndcg@k`, `recall@k`, `mrr@k`, `stop_precision` (of the documents
+the agent named as satisfying the need, how many were), `confidence_accuracy`
+(was the agent right that it had found something), and `judged@k`.
+
+`judged@k` deserves attention. Unjudged documents are scored as non-relevant,
+the standard pooled-judgment assumption; `judged@k` is how visible the cost of
+that assumption stays. On WANDS it runs around 87%, so roughly one result in
+eight is scored as a miss only because nobody labelled it.
+
+## **Comparability**
+
+The manifest records every controlled variable, the exact system prompt and its
+hash, and a hash of the episode set. `sts report` compares those across runs and
+prints warnings when they drift:
+
+```
+Comparability warnings:
+  ! effort differs: "high", "low"
+  ! runs scored different episode sets: bf0dd8619169, 91ba22c40e17
+```
+
+Two notes on reproducibility. Sampling is not a lever on current models —
+`temperature` and `top_p` are rejected by Opus 5 — so runs are pinned by model,
+`effort`, prompt version, budget, and episode set instead, and repeated runs
+will still vary. And `--difficulty hard` is computed from *the adapter's own*
+baseline, so two different backends produce different episode sets; pin one with
+`--episode-set` when comparing across backends.
+
+## **Choosing a dataset (this matters more than it looks)**
+
+Two properties decide whether a dataset can measure multi-shot search at all,
+and most IR datasets fail one of them. Full analysis and the measured table are
+in [docs/DATASETS.md](docs/DATASETS.md); the short version:
+
+**Headroom.** On WANDS, a single unmodified BM25 query already reaches
+**Success@10 of 86%**. There is almost nothing for a multi-shot agent to
+demonstrate. Always measure this first — it costs no tokens:
+
+```bash
+sts run --dataset <name> --condition static
+```
+
+**Judgment density, or a single correct answer.** A multi-shot agent surfaces
+documents the original pooling never saw, and unjudged is scored as
+non-relevant — so on a shallowly pooled dataset the benchmark *punishes the
+exact behavior it exists to reward*. WANDS is safe because it is densely
+judged (median 215 judged documents per query). Most BEIR datasets are not:
+FiQA and SciFact judge a median of 1-2 documents per query. `judged@k` is
+reported on every run so this stays visible.
+
+Known-item retrieval escapes the problem entirely: if exactly one document is
+correct and it is labelled, "unjudged means irrelevant" is not an assumption,
+it is true.
+
+| Dataset | Success@10 (single shot) | Median judged/query | Verdict |
+|---|---|---|---|
+| `wands` | 86% | 215 | Dense, but saturated |
+| `beir` fiqa | 47% | 2 | Shallow pool |
+| `beir` scidocs | 50% | 30 | Shallow pool |
+| **`trec-tot`** | **8%** | 1 (by construction) | **Both properties hold** |
+
+**TREC Tip-of-the-Tongue** is the recommended default: someone describes a film
+they cannot name, vaguely and partly wrongly, and exactly one of 232k Wikipedia
+pages is the answer. BM25 gets 8%; GPT-4 query rewriting gets 28.7% in the
+track's own baselines — hard, but demonstrably recoverable by better queries,
+which is precisely this benchmark's thesis.
+
+For datasets that are saturated but worth keeping (WANDS has product structure
+that the Tooling Track needs), build a hard subset — the queries the adapter's
+own single-shot baseline fails:
+
+```bash
+sts episodes --dataset wands --difficulty hard -o data/wands-hard.json
+# 53 of 379 queries fail the single-shot baseline
+```
+
+On that subset the static baseline scores 0% by construction, so everything a
+multi-shot agent achieves is attributable to multi-shot search. Reporting on a
+hard subset is a magnifying glass, not a substitute for the full set — report
+both, and always name which set a number came from.
+
+## **Adding a dataset**
+
+Implement `Dataset` (queries, corpus, hidden judgments) and pass
+`--dataset mypkg.module:MyDataset`. Then run the two checks above before
+trusting a number from it. One method is worth attention:
+`relevance_rubric()` states what "satisfies the information need" means for
+your collection. It is shown to the agent verbatim and is identical across
+conditions — without it the agent optimizes a different bar than the grader
+scores.
+
+## **Development**
+
+```bash
+uv pip install -e ".[dev]"
+python -m pytest          # 84 tests, no network or API key needed
+```
+
+The suite runs the whole loop against a scripted stand-in for the API, so
+budget enforcement, stopping behavior, and condition wiring are all covered
+offline.
